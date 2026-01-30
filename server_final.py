@@ -1,15 +1,35 @@
 from flask import Flask, jsonify, render_template, request, send_file
 from flask_sock import Sock
 import json
-from datetime import datetime, timedelta
-import csv
-import io
 import os
+import io
+import csv
+import mysql.connector
+from datetime import datetime
 
+# =========================
+# CONFIG
+# =========================
 app = Flask(__name__)
 sock = Sock(app)
 
-# Últimos datos IMU
+# =========================
+# MYSQL (Railway ENV VARS)
+# =========================
+DB_CONFIG = {
+    "host": os.environ.get("MYSQLHOST"),
+    "user": os.environ.get("MYSQLUSER"),
+    "password": os.environ.get("MYSQLPASSWORD"),
+    "database": os.environ.get("MYSQLDATABASE"),
+    "port": int(os.environ.get("MYSQLPORT", 3306))
+}
+
+def get_db():
+    return mysql.connector.connect(**DB_CONFIG)
+
+# =========================
+# ÚLTIMO DATO (TIEMPO REAL)
+# =========================
 latest_data = {
     "ax": 0.0,
     "ay": 0.0,
@@ -17,277 +37,159 @@ latest_data = {
     "time": ""
 }
 
-# ✅ Lista para almacenar TODOS los datos históricos
-data_history = []
-
-# ✅ Archivo CSV para persistencia
-DATA_FILE = "imu_data_history.csv"
-
 # =========================
-# Cargar datos previos al iniciar
+# CREAR TABLA SI NO EXISTE
 # =========================
-def load_history():
-    """Carga el historial de datos desde el archivo CSV si existe"""
-    global data_history
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    data_history.append({
-                        "ax": float(row["ax"]),
-                        "ay": float(row["ay"]),
-                        "az": float(row["az"]),
-                        "time": row["time"]
-                    })
-            print(f"✅ Cargados {len(data_history)} registros históricos")
-        except Exception as e:
-            print(f"⚠️ Error al cargar historial: {e}")
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS imu_data (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            ax FLOAT,
+            ay FLOAT,
+            az FLOAT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("✅ MySQL listo")
 
 # =========================
-# Guardar datos en archivo
-# =========================
-def save_to_file(data):
-    """Guarda un registro nuevo en el archivo CSV"""
-    file_exists = os.path.exists(DATA_FILE)
-    
-    try:
-        with open(DATA_FILE, 'a', newline='', encoding='utf-8') as f:
-            fieldnames = ["time", "ax", "ay", "az"]
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            
-            # Escribir encabezado solo si el archivo es nuevo
-            if not file_exists:
-                writer.writeheader()
-            
-            writer.writerow(data)
-    except Exception as e:
-        print(f"⚠️ Error al guardar en archivo: {e}")
-
-# =========================
-# WebSocket en "/"
+# WEBSOCKET ESP32
 # =========================
 @sock.route("/")
 def imu_ws(ws):
-    print("🟢 ESP32 conectada por WebSocket")
+    print("🟢 ESP32 conectada")
+
+    conn = get_db()
+    cur = conn.cursor()
 
     while True:
-        data = ws.receive()
-        if data is None:
+        msg = ws.receive()
+        if msg is None:
             print("🔴 ESP32 desconectada")
             break
 
-        print("📥 Mensaje crudo:", data)
-
         try:
-            imu = json.loads(data)
-
+            imu = json.loads(msg)
             timestamp = datetime.now().isoformat()
-            
-            latest_data["ax"] = imu["ax"]
-            latest_data["ay"] = imu["ay"]
-            latest_data["az"] = imu["az"]
-            latest_data["time"] = timestamp
 
-            # ✅ Guardar en historial
-            record = {
+            latest_data.update({
                 "ax": imu["ax"],
                 "ay": imu["ay"],
                 "az": imu["az"],
                 "time": timestamp
-            }
-            
-            data_history.append(record)
-            save_to_file(record)
+            })
 
-            print("✅ IMU guardado:", latest_data)
+            cur.execute(
+                "INSERT INTO imu_data (ax, ay, az) VALUES (%s, %s, %s)",
+                (imu["ax"], imu["ay"], imu["az"])
+            )
+            conn.commit()
 
         except Exception as e:
-            print("⚠️ Error JSON:", e)
+            print("⚠️ Error:", e)
+
+    cur.close()
+    conn.close()
 
 # =========================
-# HTML
+# MONITOR HTML
 # =========================
 @app.route("/monitor")
 def monitor():
     return render_template("monitor.html")
 
 # =========================
-# API para el HTML
+# DATA EN TIEMPO REAL
 # =========================
 @app.route("/data")
 def data():
     return jsonify(latest_data)
 
 # =========================
-# ✅ API para obtener estadísticas
-# =========================
-@app.route("/api/stats")
-def stats():
-    """Devuelve estadísticas del historial completo"""
-    return jsonify({
-        "total_records": len(data_history),
-        "first_record": data_history[0]["time"] if data_history else None,
-        "last_record": data_history[-1]["time"] if data_history else None
-    })
-
-# =========================
-# ✅ API para filtrar datos por rango de tiempo
+# FILTRAR POR RANGO HORARIO
 # =========================
 @app.route("/api/filter")
 def filter_data():
-    """Filtra datos por rango de fecha/hora"""
-    start_time = request.args.get('start')
-    end_time = request.args.get('end')
-    
-    if not start_time or not end_time:
-        return jsonify({"error": "Se requieren parámetros 'start' y 'end'"}), 400
-    
-    try:
-        # Convertir strings a datetime y remover timezone info para comparación
-        start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-        end_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
-        
-        # Remover timezone info si existe para comparación consistente
-        if start_dt.tzinfo:
-            start_dt = start_dt.replace(tzinfo=None)
-        if end_dt.tzinfo:
-            end_dt = end_dt.replace(tzinfo=None)
-        
-        # Filtrar datos en el rango
-        filtered = []
-        for record in data_history:
-            record_dt = datetime.fromisoformat(record["time"])
-            # Remover timezone info del registro también
-            if record_dt.tzinfo:
-                record_dt = record_dt.replace(tzinfo=None)
-            
-            if start_dt <= record_dt <= end_dt:
-                filtered.append(record)
-        
-        return jsonify({
-            "total": len(filtered),
-            "data": filtered
-        })
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    start = request.args.get("start")
+    end = request.args.get("end")
+
+    if not start or not end:
+        return jsonify({"error": "start y end requeridos"}), 400
+
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+
+    cur.execute("""
+        SELECT ax, ay, az, created_at
+        FROM imu_data
+        WHERE created_at BETWEEN %s AND %s
+        ORDER BY created_at ASC
+    """, (start, end))
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return jsonify({
+        "total": len(rows),
+        "data": rows
+    })
 
 # =========================
-# ✅ Descargar CSV filtrado por rango
+# DESCARGAR CSV POR RANGO
 # =========================
 @app.route("/api/download")
 def download_csv():
-    """Descarga datos en formato CSV según el rango de tiempo especificado"""
-    start_time = request.args.get('start')
-    end_time = request.args.get('end')
-    
-    if not start_time or not end_time:
-        return jsonify({"error": "Se requieren parámetros 'start' y 'end'"}), 400
-    
-    try:
-        # Convertir strings a datetime y remover timezone info para comparación
-        start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-        end_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
-        
-        # Remover timezone info si existe para comparación consistente
-        if start_dt.tzinfo:
-            start_dt = start_dt.replace(tzinfo=None)
-        if end_dt.tzinfo:
-            end_dt = end_dt.replace(tzinfo=None)
-        
-        # Filtrar datos en el rango
-        filtered = []
-        for record in data_history:
-            record_dt = datetime.fromisoformat(record["time"])
-            # Remover timezone info del registro también
-            if record_dt.tzinfo:
-                record_dt = record_dt.replace(tzinfo=None)
-            
-            if start_dt <= record_dt <= end_dt:
-                filtered.append(record)
-        
-        # Crear CSV en memoria
-        output = io.StringIO()
-        fieldnames = ["time", "ax", "ay", "az"]
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        
-        writer.writeheader()
-        for record in filtered:
-            writer.writerow(record)
-        
-        # Convertir a bytes
-        output.seek(0)
-        csv_bytes = io.BytesIO(output.getvalue().encode('utf-8'))
-        
-        # Nombre del archivo con el rango de fechas
-        filename = f"imu_data_{start_dt.strftime('%Y%m%d_%H%M')}_{end_dt.strftime('%Y%m%d_%H%M')}.csv"
-        
-        return send_file(
-            csv_bytes,
-            mimetype='text/csv',
-            as_attachment=True,
-            download_name=filename
-        )
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    start = request.args.get("start")
+    end = request.args.get("end")
+
+    if not start or not end:
+        return jsonify({"error": "start y end requeridos"}), 400
+
+    conn = get_db()
+    cur = conn.cursor(dictionary=True)
+
+    cur.execute("""
+        SELECT ax, ay, az, created_at
+        FROM imu_data
+        WHERE created_at BETWEEN %s AND %s
+        ORDER BY created_at ASC
+    """, (start, end))
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["time", "ax", "ay", "az"])
+
+    for r in rows:
+        writer.writerow([r["created_at"], r["ax"], r["ay"], r["az"]])
+
+    output.seek(0)
+    csv_bytes = io.BytesIO(output.getvalue().encode("utf-8"))
+
+    filename = f"imu_{start}_{end}.csv"
+
+    return send_file(
+        csv_bytes,
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name=filename
+    )
 
 # =========================
-# ✅ Descargar TODO el historial
-# =========================
-@app.route("/api/download/all")
-def download_all():
-    """Descarga todos los datos históricos en CSV"""
-    try:
-        # Crear CSV en memoria
-        output = io.StringIO()
-        fieldnames = ["time", "ax", "ay", "az"]
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        
-        writer.writeheader()
-        for record in data_history:
-            writer.writerow(record)
-        
-        # Convertir a bytes
-        output.seek(0)
-        csv_bytes = io.BytesIO(output.getvalue().encode('utf-8'))
-        
-        # Nombre del archivo con timestamp
-        filename = f"imu_data_complete_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        
-        return send_file(
-            csv_bytes,
-            mimetype='text/csv',
-            as_attachment=True,
-            download_name=filename
-        )
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-# =========================
-# ✅ Borrar historial (opcional)
-# =========================
-@app.route("/api/clear", methods=['POST'])
-def clear_history():
-    """Borra todo el historial de datos"""
-    global data_history
-    try:
-        data_history = []
-        
-        # Eliminar archivo
-        if os.path.exists(DATA_FILE):
-            os.remove(DATA_FILE)
-        
-        return jsonify({"success": True, "message": "Historial borrado"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+# MAIN
 # =========================
 if __name__ == "__main__":
-    print("🚀 Cargando historial de datos...")
-    load_history()
-    print(f"🚀 Servidor en http://0.0.0.0:5000")
-    print(f"📊 Monitor: http://0.0.0.0:5000/monitor")
-    app.run(host="0.0.0.0", port=5000)
+    init_db()
+    port = int(os.environ.get("PORT", 5000))
+    print("🚀 Servidor listo")
+    app.run(host="0.0.0.0", port=port)
